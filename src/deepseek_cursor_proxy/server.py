@@ -381,7 +381,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             "Origin, Content-Type, Accept, Authorization",
         )
         self.send_header("Access-Control-Expose-Headers", "Content-Length")
-        self.send_header("Access-Control-Allow-Credentials", "true")
 
     def _send_json(
         self,
