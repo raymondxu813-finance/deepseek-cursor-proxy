@@ -1257,6 +1257,44 @@ def prepare_upstream_request(
             keep_reasoning=not thinking_disabled,
         )
     )
+    if missing_indexes:
+        # Log detailed diagnostics to help identify why reasoning was missing
+        total_assistant = sum(1 for m in messages if m.get("role") == "assistant")
+        assistant_with_tools = sum(
+            1 for m in messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        roles_summary = {}
+        for m in messages:
+            r = m.get("role", "unknown")
+            roles_summary[r] = roles_summary.get(r, 0) + 1
+        LOG.warning(
+            "reasoning recovery triggered: %d missing out of %d messages "
+            "(assistant=%d, with_tool_calls=%d, roles=%s, "
+            "has_recovery_boundary=%s, patched=%d)",
+            len(missing_indexes),
+            len(messages),
+            total_assistant,
+            assistant_with_tools,
+            roles_summary,
+            continued_recovery_boundary,
+            patched_count,
+        )
+        # Log the first few missing message details
+        for idx in missing_indexes[:5]:
+            msg = messages[idx] if idx < len(messages) else {}
+            tc_names = [
+                tc.get("function", {}).get("name", "?")
+                for tc in (msg.get("tool_calls") or [])
+                if isinstance(tc, dict)
+            ]
+            LOG.warning(
+                "  missing[%d]: role=%s tool_calls=%s content_len=%d",
+                idx,
+                msg.get("role"),
+                tc_names or None,
+                len(msg.get("content") or ""),
+            )
     while missing_indexes and config.missing_reasoning_strategy == "recover":
         recovered_messages, dropped_messages, notice, recovery_step = (
             recover_messages_from_missing_reasoning(messages, missing_indexes)

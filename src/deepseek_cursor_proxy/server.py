@@ -1005,17 +1005,30 @@ def usage_from_body(body: bytes) -> dict[str, Any] | None:
     return None
 
 
+_last_message_count: int = 0
+
+
 def log_cursor_request(
     payload: dict[str, Any],
     config: ProxyConfig,
 ) -> None:
+    global _last_message_count
     model = str(payload.get("model") or config.upstream_model)
+    count = message_count(payload)
     LOG.info(
         "┌ request model=%s effort=%s messages=%s",
         model,
         config.reasoning_effort,
-        format_count(message_count(payload)),
+        format_count(count),
     )
+    if _last_message_count > 0 and count < _last_message_count * 0.5:
+        LOG.warning(
+            "  ⚠ message count dropped significantly: %d → %d "
+            "(Cursor may have started a new task/agent or trimmed context)",
+            _last_message_count,
+            count,
+        )
+    _last_message_count = count
 
 
 def log_context_summary(prepared: Any) -> None:
