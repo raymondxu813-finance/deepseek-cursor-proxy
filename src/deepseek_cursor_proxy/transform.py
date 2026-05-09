@@ -12,12 +12,14 @@ from .reasoning_store import (
     ReasoningStore,
     conversation_scope,
     message_signature,
+    stable_conversation_id,
     tool_call_ids,
     tool_call_names,
     tool_call_signature,
     turn_context_signature,
 )
 from .streaming import fold_reasoning_into_content
+from .summarize import generate_summary_via_api
 
 
 SUPPORTED_REQUEST_FIELDS = {
@@ -91,6 +93,439 @@ CURSOR_THINKING_BLOCK_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+TOKENS_PER_ENGLISH_CHAR = 0.3
+TOKENS_PER_CJK_CHAR = 0.6
+
+_FILE_PATH_RE = re.compile(
+    r"""(?:^|[\s"'`(])(/[\w./-]+\.[\w]+|[\w][\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|c|cpp|h|rb|swift|kt|vue|svelte|css|scss|html|json|yaml|yml|toml|sql|sh|md))""",
+    re.MULTILINE,
+)
+_FUNC_CLASS_RE = re.compile(
+    r"""(?:def|function|class|interface|struct|enum|type|impl|fn|func|val|var|const|let)\s+([\w]+)""",
+)
+MAX_SUMMARY_TOKENS = 800
+
+
+def _is_cjk(char: str) -> bool:
+    """Check if a character is CJK (Chinese/Japanese/Korean)."""
+    cp = ord(char)
+    return (
+        (0x4E00 <= cp <= 0x9FFF)       # CJK Unified Ideographs
+        or (0x3400 <= cp <= 0x4DBF)    # CJK Extension A
+        or (0x20000 <= cp <= 0x2A6DF)  # CJK Extension B
+        or (0xF900 <= cp <= 0xFAFF)    # CJK Compatibility Ideographs
+        or (0x2F800 <= cp <= 0x2FA1F)  # CJK Compatibility Supplement
+        or (0x3000 <= cp <= 0x303F)    # CJK Symbols and Punctuation
+        or (0xFF00 <= cp <= 0xFFEF)    # Fullwidth Forms
+        or (0x3040 <= cp <= 0x309F)    # Hiragana
+        or (0x30A0 <= cp <= 0x30FF)    # Katakana
+        or (0xAC00 <= cp <= 0xD7AF)    # Hangul Syllables
+    )
+
+
+def estimate_tokens_for_text(text: str) -> int:
+    """Estimate token count using DeepSeek's official ratios:
+    - English/ASCII: 1 char ≈ 0.3 tokens
+    - CJK (Chinese/Japanese/Korean): 1 char ≈ 0.6 tokens
+    """
+    if not text:
+        return 0
+    cjk_chars = sum(1 for c in text if _is_cjk(c))
+    other_chars = len(text) - cjk_chars
+    return int(cjk_chars * TOKENS_PER_CJK_CHAR + other_chars * TOKENS_PER_ENGLISH_CHAR)
+
+
+def estimate_message_tokens(message: dict[str, Any]) -> int:
+    """Estimate token count for a single message using language-aware ratios."""
+    total_tokens = 0
+    content = message.get("content")
+    if isinstance(content, str):
+        total_tokens += estimate_tokens_for_text(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    total_tokens += estimate_tokens_for_text(text)
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str):
+        total_tokens += estimate_tokens_for_text(reasoning)
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                fn = tc.get("function")
+                if isinstance(fn, dict):
+                    total_tokens += estimate_tokens_for_text(fn.get("name") or "")
+                    total_tokens += estimate_tokens_for_text(fn.get("arguments") or "")
+    # ~4 tokens overhead per message for role/formatting
+    return total_tokens + 4
+
+
+def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
+    """Estimate total tokens for a list of messages."""
+    return sum(estimate_message_tokens(m) for m in messages)
+
+
+def compress_long_message(message: dict[str, Any], max_tokens: int) -> dict[str, Any]:
+    """Compress a single message if it exceeds max_tokens.
+
+    Only compresses tool and assistant content. Keeps head (40%) + tail (40%)
+    and replaces the middle with a truncation notice. Returns the original
+    message unchanged if it doesn't exceed the limit or is a system/user message.
+    """
+    if max_tokens <= 0:
+        return message
+
+    role = message.get("role")
+    if role in ("system", "user"):
+        return message
+
+    tokens = estimate_message_tokens(message)
+    if tokens <= max_tokens:
+        return message
+
+    compressed = dict(message)
+    content = compressed.get("content")
+    if isinstance(content, str) and content:
+        content_tokens = estimate_tokens_for_text(content)
+        if content_tokens > max_tokens:
+            keep_ratio = max_tokens / content_tokens * 0.8
+            keep_chars = int(len(content) * keep_ratio)
+            head_size = int(keep_chars * 0.5)
+            tail_size = int(keep_chars * 0.5)
+            omitted_tokens = content_tokens - max_tokens
+            compressed["content"] = (
+                content[:head_size]
+                + f"\n\n...[truncated ~{omitted_tokens} tokens]...\n\n"
+                + content[-tail_size:]
+            )
+
+    reasoning = compressed.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        reasoning_tokens = estimate_tokens_for_text(reasoning)
+        max_reasoning_tokens = int(max_tokens * 0.5)
+        if reasoning_tokens > max_reasoning_tokens:
+            keep_ratio = max_reasoning_tokens / reasoning_tokens * 0.8
+            keep_chars = int(len(reasoning) * keep_ratio)
+            compressed["reasoning_content"] = reasoning[:keep_chars] + "..."
+
+    return compressed
+
+
+def compress_messages(
+    messages: list[dict[str, Any]], max_tokens: int
+) -> list[dict[str, Any]]:
+    """Compress all messages that exceed max_tokens individually."""
+    if max_tokens <= 0:
+        return messages
+    return [compress_long_message(m, max_tokens) for m in messages]
+
+
+def _extract_text(message: dict[str, Any]) -> str:
+    """Extract text content from a message for summarization."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _extract_tool_names(messages: list[dict[str, Any]]) -> list[str]:
+    """Extract tool/function names that were called in dropped messages."""
+    names: list[str] = []
+    for msg in messages:
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function")
+                    if isinstance(fn, dict):
+                        name = fn.get("name")
+                        if name and name not in names:
+                            names.append(name)
+    return names
+
+
+def summarize_dropped_messages(dropped_messages: list[dict[str, Any]]) -> str:
+    """Generate a concise context summary from dropped messages without extra API calls.
+    Extracts file paths, function/class names, and key topics mentioned.
+    """
+    all_text = "\n".join(_extract_text(m) for m in dropped_messages)
+
+    file_paths: list[str] = []
+    for match in _FILE_PATH_RE.finditer(all_text):
+        path = match.group(1)
+        if path not in file_paths:
+            file_paths.append(path)
+
+    symbols: list[str] = []
+    for match in _FUNC_CLASS_RE.finditer(all_text):
+        sym = match.group(1)
+        if sym not in symbols and len(sym) > 2:
+            symbols.append(sym)
+
+    tool_names = _extract_tool_names(dropped_messages)
+
+    user_topics: list[str] = []
+    for msg in dropped_messages:
+        if msg.get("role") == "user":
+            text = _extract_text(msg)
+            first_line = text.strip().split("\n")[0][:120]
+            if first_line:
+                user_topics.append(first_line)
+
+    parts: list[str] = []
+    parts.append(
+        f"[Context summary: {len(dropped_messages)} earlier messages were "
+        f"truncated to fit the context window. Key information from those messages:]"
+    )
+
+    if user_topics:
+        parts.append(f"- User discussed: {'; '.join(user_topics[:8])}")
+
+    if file_paths:
+        parts.append(f"- Files mentioned: {', '.join(file_paths[:20])}")
+
+    if symbols:
+        parts.append(f"- Symbols referenced: {', '.join(symbols[:20])}")
+
+    if tool_names:
+        parts.append(f"- Tools used: {', '.join(tool_names[:10])}")
+
+    summary = "\n".join(parts)
+    if estimate_tokens_for_text(summary) > MAX_SUMMARY_TOKENS:
+        # Iteratively trim until within budget
+        while estimate_tokens_for_text(summary) > MAX_SUMMARY_TOKENS and len(summary) > 100:
+            summary = summary[: int(len(summary) * 0.8)]
+        summary += "\n..."
+    return summary
+
+
+def _split_system_and_conversation(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split messages into leading system prefix and conversation body."""
+    system_messages: list[dict[str, Any]] = []
+    conversation_messages: list[dict[str, Any]] = []
+    in_system_prefix = True
+    for msg in messages:
+        if in_system_prefix and msg.get("role") == "system":
+            system_messages.append(msg)
+        else:
+            in_system_prefix = False
+            conversation_messages.append(msg)
+    return system_messages, conversation_messages
+
+
+def _first_msg_hash(conversation_messages: list[dict[str, Any]]) -> str:
+    """Hash of the first conversation message for verifying truncation records."""
+    if not conversation_messages:
+        return ""
+    first = conversation_messages[0]
+    content = first.get("content", "")
+    if isinstance(content, list):
+        content = str(content)[:300]
+    elif isinstance(content, str):
+        content = content[:300]
+    payload = f"{first.get('role', '')}:{content}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def truncate_messages_to_fit(
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    *,
+    target_ratio: float = 0.5,
+    strategy: str = "summarize",
+    base_url: str = "",
+    authorization: str = "",
+    model: str = "",
+    store: ReasoningStore | None = None,
+    scope: str = "",
+) -> tuple[list[dict[str, Any]], int]:
+    """Stateful context truncation.
+
+    On first truncation: drops old messages, generates summary, stores state.
+    On subsequent requests: restores the stored summary (replacing the same old
+    messages), preserving a stable prefix for DeepSeek's prompt cache.
+    Only generates a new summary when additional truncation is needed.
+
+    Returns (truncated_messages, dropped_count).
+    """
+    if max_tokens <= 0:
+        return messages, 0
+
+    system_messages, conversation_messages = _split_system_and_conversation(messages)
+
+    # --- Phase 1: Try to apply stored truncation from previous request ---
+    restored_from_cache = False
+    conv_id = stable_conversation_id(messages) if store else ""
+
+    if store and conv_id:
+        stored = store.get_context_truncation(conv_id)
+        if stored:
+            stored_hash = stored["first_msg_hash"]
+            stored_count = stored["dropped_count"]
+            current_hash = _first_msg_hash(conversation_messages)
+
+            if (
+                current_hash == stored_hash
+                and len(conversation_messages) >= stored_count
+            ):
+                # The old messages are still at the front — replace with stored summary
+                summary_message: dict[str, Any] = {
+                    "role": "system",
+                    "content": stored["summary"],
+                }
+                conversation_messages = conversation_messages[stored_count:]
+                system_messages = system_messages + [summary_message]
+                restored_from_cache = True
+                LOG.info(
+                    "restored stored truncation: replaced %d old messages with cached summary "
+                    "(saved ~%d tokens)",
+                    stored_count,
+                    stored["estimated_tokens_dropped"],
+                )
+
+    # --- Phase 2: Check if result fits within limit ---
+    reconstructed = system_messages + conversation_messages
+    current_tokens = estimate_messages_tokens(reconstructed)
+
+    if current_tokens <= max_tokens:
+        if restored_from_cache:
+            return reconstructed, 0
+        return messages, 0
+
+    # --- Phase 3: Need (additional) truncation ---
+    target_tokens = int(max_tokens * max(0.1, min(target_ratio, 0.9)))
+    system_tokens = estimate_messages_tokens(system_messages)
+    available_for_conversation = target_tokens - system_tokens - MAX_SUMMARY_TOKENS
+
+    if available_for_conversation <= 0:
+        return [system_messages[-1]] + conversation_messages[-1:], len(messages) - 2
+
+    newly_dropped: list[dict[str, Any]] = []
+    while conversation_messages and estimate_messages_tokens(conversation_messages) > available_for_conversation:
+        first = conversation_messages[0]
+        if first.get("role") == "assistant" and first.get("tool_calls"):
+            newly_dropped.append(conversation_messages.pop(0))
+            while conversation_messages and conversation_messages[0].get("role") == "tool":
+                newly_dropped.append(conversation_messages.pop(0))
+        else:
+            newly_dropped.append(conversation_messages.pop(0))
+
+    if not conversation_messages:
+        return system_messages + messages[-1:], len(messages) - len(system_messages) - 1
+
+    if newly_dropped:
+        new_summary_text = _generate_summary(
+            newly_dropped,
+            strategy=strategy,
+            base_url=base_url,
+            authorization=authorization,
+            model=model,
+        )
+
+        # Combine with previous summary if we had one
+        if restored_from_cache and store:
+            prev_summary = store.get_context_truncation(conv_id)
+            if prev_summary:
+                combined_summary = (
+                    prev_summary["summary"]
+                    + "\n\n[Additional context truncated]\n"
+                    + new_summary_text
+                )
+                total_dropped = prev_summary["dropped_count"] + len(newly_dropped)
+                total_tokens = prev_summary["estimated_tokens_dropped"] + estimate_messages_tokens(newly_dropped)
+            else:
+                combined_summary = new_summary_text
+                total_dropped = len(newly_dropped)
+                total_tokens = estimate_messages_tokens(newly_dropped)
+        else:
+            combined_summary = new_summary_text
+            # Total dropped = messages from original input that were removed
+            total_dropped = len(newly_dropped)
+            if restored_from_cache and store:
+                prev = store.get_context_truncation(conv_id)
+                if prev:
+                    total_dropped += prev["dropped_count"]
+                    total_tokens = prev["estimated_tokens_dropped"] + estimate_messages_tokens(newly_dropped)
+                else:
+                    total_tokens = estimate_messages_tokens(newly_dropped)
+            else:
+                total_tokens = estimate_messages_tokens(newly_dropped)
+
+        # Persist updated truncation state for next request
+        if store and conv_id:
+            # Compute hash against the ORIGINAL conversation start (before any replacement)
+            orig_system, orig_conv = _split_system_and_conversation(messages)
+            original_first_hash = _first_msg_hash(orig_conv)
+            try:
+                store.save_context_truncation(
+                    conversation_id=conv_id,
+                    dropped_count=total_dropped,
+                    first_msg_hash=original_first_hash,
+                    summary=combined_summary,
+                    estimated_tokens_dropped=total_tokens,
+                )
+                LOG.info(
+                    "saved truncation state: conversation=%s, total_dropped=%d, "
+                    "tokens_saved=~%d",
+                    conv_id[:8],
+                    total_dropped,
+                    total_tokens,
+                )
+            except Exception as exc:
+                LOG.warning("failed to persist truncation state: %s", exc)
+
+        # Remove old summary from system_messages if present (we'll inject combined)
+        system_messages = [
+            m for m in system_messages
+            if not (m.get("role") == "system" and "[Context summary" in (m.get("content") or ""))
+        ]
+        summary_msg: dict[str, Any] = {"role": "system", "content": combined_summary}
+        return system_messages + [summary_msg] + conversation_messages, len(newly_dropped)
+
+    return system_messages + conversation_messages, 0
+
+
+def _generate_summary(
+    dropped_messages: list[dict[str, Any]],
+    *,
+    strategy: str,
+    base_url: str,
+    authorization: str,
+    model: str,
+) -> str:
+    """Generate a summary of dropped messages using the configured strategy.
+    Falls back to lightweight if API summarization fails."""
+    if strategy == "summarize" and base_url and authorization and model:
+        estimated_tokens = estimate_messages_tokens(dropped_messages)
+        api_summary = generate_summary_via_api(
+            dropped_messages,
+            estimated_tokens,
+            base_url=base_url,
+            authorization=authorization,
+            model=model,
+        )
+        if api_summary:
+            return (
+                f"[Context summary of {len(dropped_messages)} earlier messages "
+                f"(generated by AI)]\n{api_summary}"
+            )
+        LOG.warning("API summarization failed, falling back to lightweight extraction")
+
+    return summarize_dropped_messages(dropped_messages)
+
 
 RECOVERY_NOTICE_TEXT = "[deepseek-cursor-proxy] Refreshed reasoning_content history."
 RECOVERY_NOTICE_CONTENT = f"{RECOVERY_NOTICE_TEXT}\n\n"
@@ -865,7 +1300,46 @@ def prepare_upstream_request(
         (record_response_scope, record_response_messages),
         (active_record_response_scope, messages),
     )
-    prepared["messages"] = strip_recovery_notice_for_upstream(messages)
+    final_messages = strip_recovery_notice_for_upstream(messages)
+
+    # Compress individual long messages before checking overall context size
+    if config.max_single_message_tokens > 0:
+        final_messages = compress_messages(
+            final_messages, config.max_single_message_tokens
+        )
+
+    # Truncate context if it exceeds the configured token limit
+    context_truncated_messages = 0
+    if config.max_context_tokens > 0:
+        estimated_input = estimate_messages_tokens(final_messages)
+        LOG.info(
+            "context estimate: ~%d tokens (limit=%d)",
+            estimated_input,
+            config.max_context_tokens,
+        )
+        summary_model = config.summary_model or upstream_model
+        final_messages, context_truncated_messages = truncate_messages_to_fit(
+            final_messages,
+            config.max_context_tokens,
+            target_ratio=config.truncation_target_ratio,
+            strategy=config.context_overflow_strategy,
+            base_url=config.upstream_base_url,
+            authorization=authorization or "",
+            model=summary_model,
+            store=store,
+            scope=active_record_response_scope,
+        )
+        if context_truncated_messages > 0:
+            LOG.warning(
+                "context truncation dropped %d message(s) to fit within %d token limit "
+                "(strategy=%s, estimated %d tokens before truncation)",
+                context_truncated_messages,
+                config.max_context_tokens,
+                config.context_overflow_strategy,
+                estimate_messages_tokens(messages),
+            )
+
+    prepared["messages"] = final_messages
 
     return PreparedRequest(
         payload=prepared,

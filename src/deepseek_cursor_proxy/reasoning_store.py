@@ -102,6 +102,31 @@ def conversation_scope(messages: list[dict[str, Any]], namespace: str = "") -> s
     return _sha256_json(payload)
 
 
+def stable_conversation_id(messages: list[dict[str, Any]]) -> str:
+    """Generate a stable ID for a conversation that doesn't change as messages are appended.
+
+    Uses the system prompt + first user message as fingerprint. This remains constant
+    across the entire conversation lifetime, enabling cross-request matching.
+    """
+    parts: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                parts.append(f"sys:{content[:500]}")
+        elif role == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [p.get("text", "") for p in content if isinstance(p, dict)]
+                content = " ".join(text_parts)
+            if isinstance(content, str):
+                parts.append(f"usr:{content[:500]}")
+            break
+    fingerprint = "\n".join(parts)
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+
+
 def turn_context_signature(prior_messages: list[dict[str, Any]]) -> str:
     last_user_index = next(
         (
@@ -206,6 +231,30 @@ class ReasoningStore:
                 reasoning TEXT NOT NULL,
                 message_json TEXT NOT NULL,
                 created_at REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS truncated_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                messages_json TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                estimated_tokens INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_truncation (
+                conversation_id TEXT PRIMARY KEY,
+                dropped_count INTEGER NOT NULL,
+                first_msg_hash TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                estimated_tokens_dropped INTEGER NOT NULL,
+                updated_at REAL NOT NULL
             )
             """
         )
@@ -318,12 +367,129 @@ class ReasoningStore:
             self._conn.commit()
         return deleted
 
+    def save_truncated_history(
+        self,
+        scope: str,
+        dropped_messages: list[dict[str, Any]],
+        summary: str,
+        estimated_tokens: int,
+    ) -> None:
+        """Persist truncated messages for potential future recovery."""
+        messages_json = json.dumps(
+            dropped_messages, ensure_ascii=False, separators=(",", ":")
+        )
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO truncated_history
+                    (scope, messages_json, summary, estimated_tokens, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (scope, messages_json, summary, estimated_tokens, time.time()),
+            )
+            self._conn.commit()
+
+    def get_truncated_history(
+        self, scope: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Retrieve previously truncated message batches for a conversation scope."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT messages_json, summary, estimated_tokens, created_at
+                FROM truncated_history
+                WHERE scope = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (scope, limit),
+            ).fetchall()
+        results = []
+        for messages_json, summary, estimated_tokens, created_at in rows:
+            results.append(
+                {
+                    "messages": json.loads(messages_json),
+                    "summary": summary,
+                    "estimated_tokens": estimated_tokens,
+                    "created_at": created_at,
+                }
+            )
+        return results
+
+    def save_context_truncation(
+        self,
+        conversation_id: str,
+        dropped_count: int,
+        first_msg_hash: str,
+        summary: str,
+        estimated_tokens_dropped: int,
+    ) -> None:
+        """Save or update the truncation state for a conversation (upsert)."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO context_truncation
+                    (conversation_id, dropped_count, first_msg_hash, summary,
+                     estimated_tokens_dropped, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    dropped_count = excluded.dropped_count,
+                    first_msg_hash = excluded.first_msg_hash,
+                    summary = excluded.summary,
+                    estimated_tokens_dropped = excluded.estimated_tokens_dropped,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_id,
+                    dropped_count,
+                    first_msg_hash,
+                    summary,
+                    estimated_tokens_dropped,
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+
+    def get_context_truncation(
+        self, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """Load the stored truncation state for a conversation."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT dropped_count, first_msg_hash, summary,
+                       estimated_tokens_dropped, updated_at
+                FROM context_truncation
+                WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "dropped_count": row[0],
+            "first_msg_hash": row[1],
+            "summary": row[2],
+            "estimated_tokens_dropped": row[3],
+            "updated_at": row[4],
+        }
+
     def _prune_locked(self) -> int:
         deleted = 0
         if self.max_age_seconds is not None and self.max_age_seconds > 0:
             cutoff = time.time() - self.max_age_seconds
             cursor = self._conn.execute(
                 "DELETE FROM reasoning_cache WHERE created_at < ?",
+                (cutoff,),
+            )
+            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+            cursor = self._conn.execute(
+                "DELETE FROM truncated_history WHERE created_at < ?",
+                (cutoff,),
+            )
+            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+            cursor = self._conn.execute(
+                "DELETE FROM context_truncation WHERE updated_at < ?",
                 (cutoff,),
             )
             deleted += cursor.rowcount if cursor.rowcount != -1 else 0

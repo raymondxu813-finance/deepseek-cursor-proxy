@@ -31,6 +31,11 @@ DEFAULT_CORS = False
 DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
+DEFAULT_MAX_CONTEXT_TOKENS = 800_000
+DEFAULT_CONTEXT_OVERFLOW_STRATEGY = "summarize"
+DEFAULT_TRUNCATION_TARGET_RATIO = 0.5
+DEFAULT_MAX_SINGLE_MESSAGE_TOKENS = 8_000
+DEFAULT_SUMMARY_MODEL = "deepseek-v4-flash"
 
 DEFAULT_CONFIG_HEADER = (
     "# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml."
@@ -59,6 +64,11 @@ reasoning_content_path: {REASONING_CONTENT_FILE_NAME}
 missing_reasoning_strategy: {DEFAULT_MISSING_REASONING_STRATEGY}
 reasoning_cache_max_age_seconds: {DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS}
 reasoning_cache_max_rows: {DEFAULT_REASONING_CACHE_MAX_ROWS}
+max_context_tokens: {DEFAULT_MAX_CONTEXT_TOKENS}
+context_overflow_strategy: {DEFAULT_CONTEXT_OVERFLOW_STRATEGY}
+truncation_target_ratio: {DEFAULT_TRUNCATION_TARGET_RATIO}
+max_single_message_tokens: {DEFAULT_MAX_SINGLE_MESSAGE_TOKENS}
+summary_model: {DEFAULT_SUMMARY_MODEL}
 """
 
 
@@ -184,6 +194,13 @@ def normalize_missing_reasoning_strategy(value: Any) -> str:
     return DEFAULT_MISSING_REASONING_STRATEGY
 
 
+def normalize_context_overflow_strategy(value: Any) -> str:
+    strategy = as_str(value, DEFAULT_CONTEXT_OVERFLOW_STRATEGY).strip().lower()
+    if strategy in {"truncate", "summarize"}:
+        return strategy
+    return DEFAULT_CONTEXT_OVERFLOW_STRATEGY
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     host: str = DEFAULT_HOST
@@ -198,6 +215,11 @@ class ProxyConfig:
     missing_reasoning_strategy: str = DEFAULT_MISSING_REASONING_STRATEGY
     reasoning_cache_max_age_seconds: int = DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS
     reasoning_cache_max_rows: int = DEFAULT_REASONING_CACHE_MAX_ROWS
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
+    context_overflow_strategy: str = DEFAULT_CONTEXT_OVERFLOW_STRATEGY
+    truncation_target_ratio: float = DEFAULT_TRUNCATION_TARGET_RATIO
+    max_single_message_tokens: int = DEFAULT_MAX_SINGLE_MESSAGE_TOKENS
+    summary_model: str = DEFAULT_SUMMARY_MODEL
     display_reasoning: bool = DEFAULT_DISPLAY_REASONING
     collapsible_reasoning: bool = DEFAULT_COLLAPSIBLE_REASONING
     cors: bool = DEFAULT_CORS
@@ -258,6 +280,25 @@ class ProxyConfig:
             reasoning_cache_max_rows=as_int(
                 setting_value(settings, "reasoning_cache_max_rows"),
                 DEFAULT_REASONING_CACHE_MAX_ROWS,
+            ),
+            max_context_tokens=as_int(
+                setting_value(settings, "max_context_tokens"),
+                DEFAULT_MAX_CONTEXT_TOKENS,
+            ),
+            context_overflow_strategy=normalize_context_overflow_strategy(
+                setting_value(settings, "context_overflow_strategy")
+            ),
+            truncation_target_ratio=as_float(
+                setting_value(settings, "truncation_target_ratio"),
+                DEFAULT_TRUNCATION_TARGET_RATIO,
+            ),
+            max_single_message_tokens=as_int(
+                setting_value(settings, "max_single_message_tokens"),
+                DEFAULT_MAX_SINGLE_MESSAGE_TOKENS,
+            ),
+            summary_model=as_str(
+                setting_value(settings, "summary_model"),
+                DEFAULT_SUMMARY_MODEL,
             ),
             display_reasoning=as_bool(
                 setting_value(settings, "display_reasoning"),
