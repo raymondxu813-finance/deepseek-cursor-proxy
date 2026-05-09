@@ -1058,42 +1058,28 @@ def recover_messages_from_missing_reasoning(
             },
         )
 
-    last_user_index = next(
-        (
-            index
-            for index in range(len(messages) - 1, -1, -1)
-            if messages[index].get("role") == "user"
-        ),
-        -1,
+    # Instead of dropping the entire conversation, inject placeholder reasoning
+    # for messages that need it. This preserves context while satisfying the API
+    # requirement that tool-call assistant messages have reasoning_content.
+    patched_messages = list(messages)
+    for idx in missing_indexes:
+        if idx < len(patched_messages):
+            msg = dict(patched_messages[idx])
+            msg["reasoning_content"] = "..."
+            patched_messages[idx] = msg
+    LOG.info(
+        "injected placeholder reasoning for %d messages (preserving full context)",
+        len(missing_indexes),
     )
-    if last_user_index == -1:
-        return (
-            messages,
-            0,
-            None,
-            {
-                "strategy": "none",
-                "missing_indexes": missing_indexes,
-                "last_user_index": None,
-                "dropped_messages": 0,
-                "notice": None,
-            },
-        )
-
-    recovered = leading_system_messages(messages)
-    omitted_messages = len(messages) - len(recovered) - 1
-    recovered.append({"role": "system", "content": RECOVERY_SYSTEM_CONTENT})
-    recovered.append(messages[last_user_index])
     return (
-        recovered,
-        omitted_messages,
-        RECOVERY_NOTICE_CONTENT,
+        patched_messages,
+        0,
+        None,
         {
-            "strategy": "latest_user",
+            "strategy": "placeholder_reasoning",
             "missing_indexes": missing_indexes,
-            "last_user_index": last_user_index,
-            "dropped_messages": omitted_messages,
-            "notice": RECOVERY_NOTICE_CONTENT,
+            "dropped_messages": 0,
+            "notice": None,
         },
     )
 
@@ -1277,6 +1263,9 @@ def prepare_upstream_request(
         )
         recovery_steps.append(recovery_step)
         if not dropped_messages:
+            # Placeholder reasoning was injected — apply patched messages and stop
+            messages = recovered_messages
+            missing_indexes = []
             break
         recovered_count += len(missing_indexes)
         recovery_dropped_messages += dropped_messages
